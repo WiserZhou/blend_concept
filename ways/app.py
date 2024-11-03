@@ -1,5 +1,5 @@
 import gradio as gr
-from magic_mix import magic_mix
+from blend_concept.ways.magic_mix_multi_head import magic_mix
 
 iface = gr.Interface(
     description="Implementation of MagicMix: Semantic Mixing with Diffusion Models paper",

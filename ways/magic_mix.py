@@ -6,6 +6,7 @@ import torch
 from torchvision import transforms
 from tqdm.auto import tqdm
 from PIL import Image
+import math
 
 logging.set_verbosity_error()
 
@@ -19,6 +20,20 @@ class MagicMixConfig:
     steps: int = 50
     guidance_scale: float = 7.5
     device: str = "cuda:6" if torch.cuda.is_available() else "cpu"
+    text_feature_type: str = "pooled"  # ['pooled', 'mean', 'attention', 'max', 'multihead']
+    num_heads: int = 8  # 用于multihead方式
+
+class MultiHeadPooling(torch.nn.Module):
+    def __init__(self, hidden_size, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.attention = torch.nn.MultiheadAttention(hidden_size, num_heads)
+        
+    def forward(self, x):
+        x = x.transpose(0, 1)
+        query = x.mean(dim=0, keepdim=True)
+        out, _ = self.attention(query, x, x)
+        return out.squeeze(0)
 
 class MagicMix:
     def __init__(self, config: Optional[MagicMixConfig] = None):
@@ -42,6 +57,13 @@ class MagicMix:
             set_alpha_to_one=False,
         )
 
+        # 如果使用multihead方式，初始化pooling层
+        if self.config.text_feature_type == "multihead":
+            self.pooling = MultiHeadPooling(
+                self.text_encoder.config.hidden_size, 
+                self.config.num_heads
+            ).to(self.device)
+
     def encode(self, img: Image.Image) -> torch.Tensor:
         """Convert PIL image to latents"""
         with torch.no_grad():
@@ -61,8 +83,47 @@ class MagicMix:
         img = (img * 255).round().astype("uint8")
         return Image.fromarray(img[0])
 
+    def _process_hidden_states(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Process hidden states based on configured method"""
+        if self.config.text_feature_type == "pooled":
+            # 使用原始的pooled output
+            return hidden_states
+
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.unsqueeze(-1)
+
+        if self.config.text_feature_type == "mean":
+            # 平均池化
+            if attention_mask is not None:
+                # 计算非填充位置的平均值
+                return (hidden_states.sum(dim=1) / attention_mask.sum(dim=1, keepdim=True))
+            return hidden_states.mean(dim=1)
+
+        elif self.config.text_feature_type == "max":
+            # 最大池化
+            if attention_mask is not None:
+                hidden_states[~attention_mask.bool()] = float('-inf')
+            return hidden_states.max(dim=1)[0]
+
+        elif self.config.text_feature_type == "attention":
+            # 注意力加权平均
+            attention_weights = torch.nn.functional.softmax(
+                (hidden_states @ hidden_states.transpose(-2, -1)) / math.sqrt(hidden_states.size(-1)),
+                dim=-1
+            )
+            if attention_mask is not None:
+                attention_weights = attention_weights * attention_mask.unsqueeze(1)
+                attention_weights = attention_weights / attention_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            return (attention_weights @ hidden_states).mean(dim=1)
+
+        elif self.config.text_feature_type == "multihead":
+            # 多头注意力池化
+            return self.pooling(hidden_states)
+
+        raise ValueError(f"Unknown text_feature_type: {self.config.text_feature_type}")
+
     def prep_text(self, prompt: str) -> torch.Tensor:
-        """Convert prompt into text embeddings and unconditional embeddings"""
+        """Convert prompt into text embeddings using specified method"""
         text_input = self.tokenizer(
             prompt,
             padding="max_length",
@@ -70,8 +131,15 @@ class MagicMix:
             truncation=True,
             return_tensors="pt",
         )
-        text_embedding = self.text_encoder(text_input.input_ids.to(self.device))[0]
         
+        if self.config.text_feature_type == "pooled":
+            text_embedding = self.text_encoder(text_input.input_ids.to(self.device))[1]
+        else:
+            hidden_states = self.text_encoder(text_input.input_ids.to(self.device))[0]
+            attention_mask = text_input.attention_mask.to(self.device)
+            text_embedding = self._process_hidden_states(hidden_states, attention_mask)
+
+        # 处理无条件嵌入
         uncond_input = self.tokenizer(
             "",
             padding="max_length",
@@ -79,7 +147,13 @@ class MagicMix:
             truncation=True,
             return_tensors="pt",
         )
-        uncond_embedding = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+        
+        if self.config.text_feature_type == "pooled":
+            uncond_embedding = self.text_encoder(uncond_input.input_ids.to(self.device))[1]
+        else:
+            uncond_states = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+            uncond_mask = uncond_input.attention_mask.to(self.device)
+            uncond_embedding = self._process_hidden_states(uncond_states, uncond_mask)
         
         return torch.cat([uncond_embedding, text_embedding])
 
@@ -132,6 +206,19 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument(
+        "--text_feature_type",
+        type=str,
+        default="pooled",
+        choices=["pooled", "mean", "attention", "max", "multihead"],
+        help="Method to process text features"
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=8,
+        help="Number of attention heads for multihead pooling"
+    )
     
     args = parser.parse_args()
     config = MagicMixConfig(**vars(args))
