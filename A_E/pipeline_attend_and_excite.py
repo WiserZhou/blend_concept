@@ -205,6 +205,8 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
             # 获取当前token的注意力图
             image = attention_for_text[:, :, i]
             
+            print(image.shape)
+            
             # 如果启用了注意力平滑
             if smooth_attentions:
                 # 创建高斯平滑层
@@ -324,7 +326,7 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
                 sigma=sigma,
                 kernel_size=kernel_size,
                 normalize_eot=normalize_eot
-                )
+            )
 
             loss, losses = self._compute_loss(max_attention_per_index, return_losses=True)
 
