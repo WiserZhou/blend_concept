@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 
 from A_E.config import RunConfig
-from A_E.pipeline_attend_and_excite import AttendAndExcitePipeline
+from blend_concept.A_E.pipeline_attend_and_excite2 import AttendAndExcitePipeline
 from A_E import ptp_utils, vis_utils
 from A_E.ptp_utils import AttentionStore
 

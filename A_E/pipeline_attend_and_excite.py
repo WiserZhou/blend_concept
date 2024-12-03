@@ -159,7 +159,8 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
                                          smooth_attentions: bool = False,
                                          sigma: float = 0.5,
                                          kernel_size: int = 3,
-                                         normalize_eot: bool = False) -> List[torch.Tensor]:
+                                         normalize_eot: bool = False,
+                                         sample_strategy: str = None) -> List[torch.Tensor]:
         """
         计算每个需要修改的token的最大注意力值
         
@@ -186,39 +187,60 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
             # 获取prompt的token长度
             last_idx = len(self.tokenizer(prompt)['input_ids']) - 1
         
-        # 提取文本相关的注意力图，去除第一个token(通常是[CLS])
-        # 如果启用EOT归一化，则只保留到last_idx的部分
+        # 提取文本相关的注意力图，去除第一个token
         attention_for_text = attention_maps[:, :, 1:last_idx]
         
         # 将注意力值放大100倍，使差异更明显
         attention_for_text *= 100
         
-        # 对注意力值进行softmax归一化，使其和为1
+        # 对整个注意力图进行softmax归一化
         attention_for_text = torch.nn.functional.softmax(attention_for_text, dim=-1)
 
         # 由于移除了第一个token，需要将索引值都减1
         indices_to_alter = [index - 1 for index in indices_to_alter]
-
+        # 获取pipeline的设备
+        device = self._execution_device
         # 提取每个token的最大注意力值
         max_indices_list = []
         for i in indices_to_alter:
             # 获取当前token的注意力图
             image = attention_for_text[:, :, i]
             
-            print(image.shape)
-            
-            # 如果启用了注意力平滑
             if smooth_attentions:
                 # 创建高斯平滑层
-                smoothing = GaussianSmoothing(channels=1, kernel_size=kernel_size, sigma=sigma, dim=2).cuda()
+                smoothing = GaussianSmoothing(channels=1, kernel_size=kernel_size, sigma=sigma, dim=2).to(device)
                 # 添加通道维度并进行边缘填充
                 input = F.pad(image.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='reflect')
                 # 应用高斯平滑并移除额外的维度
                 image = smoothing(input).squeeze(0).squeeze(0)
-                
-            # 将当前token的最大注意力值添加到列表中
-            max_indices_list.append(image.max())
             
+            # Get the center 8x8 region from the 16x16 attention map
+            h, w = image.shape
+            
+            sample_strategy = 'gc'
+            center_x = None
+            center_y = None
+            
+
+            # 创建坐标网格
+            y, x = torch.meshgrid(torch.linspace(0, h-1, h), torch.linspace(0, w-1, w))
+            # 将坐标网格移到与image相同的设备上
+            x = x.to(image.device)
+            y = y.to(image.device)
+            
+            # 计算重心坐标
+            total_mass = image.sum()
+            center_x = (x * image).sum() / total_mass
+            center_y = (y * image).sum() / total_mass
+            
+            # 计算重心的整数坐标
+            # center_x = int(center_x.round())
+            # center_y = int(center_y.round())
+
+            max_indices_list.append(image.max())
+            max_indices_list.append(center_x)
+            max_indices_list.append(center_y)
+        
         return max_indices_list
 
     def _aggregate_and_get_max_attention_per_token(self, attention_store: AttentionStore,
@@ -227,7 +249,8 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
                                                    smooth_attentions: bool = False,
                                                    sigma: float = 0.5,
                                                    kernel_size: int = 3,
-                                                   normalize_eot: bool = False):
+                                                   normalize_eot: bool = False,
+                                                   sample_strategy: str = None):
         """
         聚合每个token的注意力并计算每个需要修改的token的最大激活值
         
@@ -267,25 +290,52 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
             smooth_attentions=smooth_attentions,
             sigma=sigma,
             kernel_size=kernel_size,
-            normalize_eot=normalize_eot)
+            normalize_eot=normalize_eot,
+            sample_strategy=sample_strategy)
         
         return max_attention_per_index
 
     @staticmethod
     def _compute_loss(max_attention_per_index: List[torch.Tensor], return_losses: bool = False) -> torch.Tensor:
         """ Computes the attend-and-excite loss using the maximum attention value for each token. """
-        losses = [max(0, 1. - curr_max) for curr_max in max_attention_per_index]
-        loss = max(losses)
+        losses = []
+        
+        distance = 0
+        
+        for i in range(len(max_attention_per_index)):
+            if i % 3 == 0:
+                losses.append(max(0, 1. - max_attention_per_index[i]))
+ 
+        distance = (max_attention_per_index[1] - max_attention_per_index[2]) ** 2 + \
+            (max_attention_per_index[4] - max_attention_per_index[5]) ** 2
+        # losses = [max(0, 1. - curr_max) for curr_max in max_attention_per_index]
+        # 将-2转换为张量，并确保在正确的设备上
+        exp_tensor = torch.tensor(1/50, device=distance.device, dtype=distance.dtype)
+        loss = max(losses) + distance * exp_tensor
+        
         if return_losses:
             return loss, losses
         else:
             return loss
 
     @staticmethod
-    def _update_latent(latents: torch.Tensor, loss: torch.Tensor, step_size: float) -> torch.Tensor:
-        """ Update the latent according to the computed loss. """
-        grad_cond = torch.autograd.grad(loss.requires_grad_(True), [latents], retain_graph=True)[0]
+    def _update_latent(latents: torch.Tensor,
+                      loss: torch.Tensor,
+                      step_size: float) -> torch.Tensor:
+        """更新潜在空间表示，根据计算得到的损失进行梯度下降"""
+        
+        # 1. 计算梯度
+        grad_cond = torch.autograd.grad(
+            loss.requires_grad_(True),  # 确保损失值可以计算梯度
+            [latents],                  # 需要计算梯度的张量
+            retain_graph=True,          # 保留计算图以便后续使用
+            allow_unused=True,          # 添加这个参数以处理未使用的张量
+        )[0]  # 取第一个（也是唯一一个）梯度值
+        
+        # 2. 更新潜在空间表示
+        # 使用梯度下降法：新值 = 旧值 - 步长 * 梯度
         latents = latents - step_size * grad_cond
+        
         return latents
 
     def _perform_iterative_refinement_step(self,
@@ -303,7 +353,8 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
                                            sigma: float = 0.5,
                                            kernel_size: int = 3,
                                            max_refinement_steps: int = 20,
-                                           normalize_eot: bool = False):
+                                           normalize_eot: bool = False,
+                                           sample_strategy: str = None):
         """
         Performs the iterative latent refinement introduced in the paper. Here, we continuously update the latent
         code according to our loss objective until the given threshold is reached for all tokens.
@@ -314,7 +365,7 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
             iteration += 1
 
             latents = latents.clone().detach().requires_grad_(True)
-            # noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+            noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
             self.unet.zero_grad()
 
             # Get max activation value for each subject token
@@ -325,7 +376,8 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
                 smooth_attentions=smooth_attentions,
                 sigma=sigma,
                 kernel_size=kernel_size,
-                normalize_eot=normalize_eot
+                normalize_eot=normalize_eot,
+                sample_strategy=sample_strategy
             )
 
             loss, losses = self._compute_loss(max_attention_per_index, return_losses=True)
@@ -333,9 +385,9 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
             if loss != 0:
                 latents = self._update_latent(latents, loss, step_size)
 
-            # with torch.no_grad():
-            #     noise_pred_uncond = self.unet(latents, t, encoder_hidden_states=text_embeddings[0].unsqueeze(0)).sample
-            #     noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+            with torch.no_grad():
+                noise_pred_uncond = self.unet(latents, t, encoder_hidden_states=text_embeddings[0].unsqueeze(0)).sample
+                noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
 
             try:
                 # 将losses列表中的每个元素转换为Python数值
@@ -363,7 +415,7 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
         # Run one more time but don't compute gradients and update the latents.
         # We just need to compute the new loss - the grad update will occur below
         latents = latents.clone().detach().requires_grad_(True)
-        # noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
+        noise_pred_text = self.unet(latents, t, encoder_hidden_states=text_embeddings[1].unsqueeze(0)).sample
         self.unet.zero_grad()
 
         # Get max activation value for each subject token
@@ -374,7 +426,9 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
             smooth_attentions=smooth_attentions,
             sigma=sigma,
             kernel_size=kernel_size,
-            normalize_eot=normalize_eot)
+            normalize_eot=normalize_eot,
+            sample_strategy=sample_strategy
+            )
         loss, losses = self._compute_loss(max_attention_per_index, return_losses=True)
         print(f"\t Finished with loss of: {loss}")
         return loss, latents, max_attention_per_index
@@ -420,10 +474,12 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
             sigma: float = 0.5,                              # 高斯平滑的sigma值
             kernel_size: int = 3,                            # 高斯核大小
             sd_2_1: bool = False,                            # 是否使用SD 2.1版本
+            sample_strategy: str = None,                    # 采样策略
     ):
         """
         Pipeline的主要调用函数，用于生成图像
         """
+        
         # 1. 设置图像尺寸
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -505,7 +561,8 @@ class AttendAndExcitePipeline(StableDiffusionPipeline):
                         smooth_attentions=smooth_attentions,  # 是否平滑注意力图
                         sigma=sigma,  # 高斯平滑的sigma参数
                         kernel_size=kernel_size,  # 高斯核大小
-                        normalize_eot=sd_2_1  # 是否归一化EOT token
+                        normalize_eot=sd_2_1,  # 是否归一化EOT token
+                        sample_strategy=sample_strategy
                     )
 
                     if not run_standard_sd:
